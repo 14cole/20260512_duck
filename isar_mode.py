@@ -162,16 +162,20 @@ def _compute_band_backprojection(
 
     Math: for a target rotating in the (x, y) plane (or equivalently, the
     radar looking at angles θ_n around the target), the round-trip path-length
-    difference for a scatterer at (x, y) is 2·(x sin θ + y cos θ), and the
-    measured backscatter follows S(θ, k) ∝ exp(+j · 2 k r). The matched-filter
-    image at hypothesised pixel (x, y) is therefore
+    difference for a scatterer at (x, y) is 2·(x sin θ + y cos θ). Under the
+    physics / e^{-jωt} convention used by `generate_airplane.py` and most
+    SAR/ISAR textbooks (Soumekh, Carrara/Goodman/Majewski), the measured
+    backscatter is
 
-        I(x, y) = ∑_{n, m} S(θ_n, f_m) · exp(-j · 2 k_m · (x sin θ_n + y cos θ_n))
+        S(θ, k) ∝ exp(-j · 2 k r)
 
-    (negative sign — conjugate of the data kernel, matching the +j convention
-    used by the existing decoupled-FFT and PFA paths which both rely on
-    np.fft.ifft). We factor the exponential as
-    exp(-j · 2 k_m · x sin θ_n) · exp(-j · 2 k_m · y cos θ_n) and evaluate the
+    so the matched-filter focusing kernel is its conjugate and the back-
+    projection image is
+
+        I(x, y) = ∑_{n, m} S(θ_n, f_m) · exp(+j · 2 k_m · (x sin θ_n + y cos θ_n))
+
+    We factor the exponential as
+    exp(+j · 2 k_m · x sin θ_n) · exp(+j · 2 k_m · y cos θ_n) and evaluate the
     inner sum-over-frequency as a single (n_x, n_f) @ (n_f, n_y) matrix
     multiply per angle, which is ~10×–100× faster than the naive triple loop
     while keeping memory bounded.
@@ -205,12 +209,12 @@ def _compute_band_backprojection(
     #
     # where u_n(x, m) = exp(j · 2 k_m x sin θ_n) and
     #       v_n(y, m) = exp(j · 2 k_m y cos θ_n).
-    neg_two_k = -2.0 * k  # (n_freq,)
+    two_k = 2.0 * k  # (n_freq,)  — positive sign matches the physics convention
     for n in range(n_az):
-        u = np.exp(1j * np.outer(x_grid * sin_t[n], neg_two_k))  # (n_x, n_freq)
-        v = np.exp(1j * np.outer(y_grid * cos_t[n], neg_two_k))  # (n_y, n_freq)
-        scaled = u * rcs_windowed[n][None, :]                     # (n_x, n_freq)
-        image += scaled @ v.T                                     # (n_x, n_y)
+        u = np.exp(1j * np.outer(x_grid * sin_t[n], two_k))  # (n_x, n_freq)
+        v = np.exp(1j * np.outer(y_grid * cos_t[n], two_k))  # (n_y, n_freq)
+        scaled = u * rcs_windowed[n][None, :]                 # (n_x, n_freq)
+        image += scaled @ v.T                                 # (n_x, n_y)
 
     # Normalize so a unit-amplitude scatterer at the origin produces a unit-
     # magnitude peak (→ 0 dB after the dBsm conversion).  At origin every
@@ -223,6 +227,57 @@ def _compute_band_backprojection(
     y_range = y_grid * unit_scale
 
     return image, x_range, y_range
+
+
+def _compute_band_polar_format(
+    self,
+    rcs_polar: np.ndarray,
+    theta: np.ndarray,
+    freq_hz: np.ndarray,
+    df: float,
+    unit_scale: float,
+):
+    """Polar Format Algorithm (loose form, a.k.a. Decoupled FFT).
+
+    Treats `S(θ, f)` *as if* `(θ, f)` were Cartesian k-space coordinates
+    (`k_x ∝ 2 f_c sin θ ≈ 2 f_c θ`, `k_y ∝ 2 f - 2 f_c`) and runs two
+    independent 1-D IFFTs — over frequency to get range, then over azimuth
+    to get cross-range. No polar-to-Cartesian remap, so the algorithm has
+    no `tan(θ)` step and tolerates any aperture (including full 360°).
+
+    The small-angle / paraxial identification distorts scatterer positions
+    away from broadside and produces the cross-shaped sidelobe pattern that
+    other FFT-based ISAR tools call "PFA at full aperture". Back-projection
+    is the geometrically exact alternative.
+
+    Normalisation: `np.fft.ifft2` is `1 / (n_kx · n_freq)` — the canonical
+    convention shared by most commercial ISAR tools, so absolute dB values
+    line up with them without a per-tool offset.
+    """
+    n_az = theta.size
+    n_freq = freq_hz.size
+
+    win_az = self._isar_window(n_az)
+    win_freq = self._isar_window(n_freq)
+    rcs_windowed = rcs_polar * np.outer(win_az, win_freq)
+
+    # Inverse FFT over frequency (→ range) then azimuth (→ cross-range).
+    # np.fft.ifft's `exp(+j·2π·m·n/N)` kernel matches the physics convention
+    # `S(θ, f) ∝ exp(-j·2k·r)` used by the back-projection path and by
+    # generate_airplane.py — so peak positions land at +(x, y).
+    range_az = np.fft.ifft(rcs_windowed, axis=1)
+    isar_complex = np.fft.ifft(range_az, axis=0)
+    isar_complex = np.fft.fftshift(isar_complex, axes=(0, 1))
+
+    c0 = 299_792_458.0
+    dtheta = float(np.mean(np.diff(theta)))
+    f_c = float(np.mean(freq_hz))
+
+    y_range = np.fft.fftshift(np.fft.fftfreq(n_freq, d=df)) * (c0 / 2.0) * unit_scale
+    cross_freq_grid_d = (np.arange(n_az) - n_az // 2) / (n_az * dtheta)
+    x_range = cross_freq_grid_d * (c0 / (2.0 * max(f_c, 1.0))) * unit_scale
+
+    return isar_complex, x_range, y_range
 
 
 def _decoupled_scene_half_extents(
@@ -259,6 +314,7 @@ def _compute_band(
     df: float,
     unit_scale: float,
     *,
+    algorithm: str = "back-projection",
     az_target_deg: np.ndarray | None = None,
 ):
     band_az_values = self.active_dataset.azimuths[band_az_indices]
@@ -306,23 +362,35 @@ def _compute_band(
         df_eff = df
     az_values = az_uniform
 
-    # Back-projection on a square scene sized to the larger of the two
-    # decoupled-FFT half-extents — full-sweep data is symmetric in cross-
-    # range and range, and this keeps everything visible. Image pixels are
-    # capped so the O(N_θ·N_x·N_y·N_f) sum stays interactive.
-    half_x_m, half_y_m = _decoupled_scene_half_extents(theta, freq_uniform, df_eff)
-    n_pix_default = int(np.clip(max(theta.size, freq_uniform.size), 128, 512))
-    complex_image, x_range, y_range = _compute_band_backprojection(
-        self,
-        rcs_slice,
-        theta,
-        freq_uniform,
-        n_pix_default,
-        n_pix_default,
-        half_x_m,
-        half_y_m,
-        unit_scale,
-    )
+    if algorithm == "polar format":
+        # Loose-PFA / Decoupled-FFT path. Scene extent comes out rectangular
+        # and is dictated by the sampling; matches FFT-based tools' dB scale.
+        complex_image, x_range, y_range = _compute_band_polar_format(
+            self, rcs_slice, theta, freq_uniform, df_eff, unit_scale
+        )
+    else:
+        # Back-projection on a square scene sized to the larger of the two
+        # natural half-extents:
+        #   cross-range half:  c / (4 · f_c · dθ)
+        #   range       half:  c / (4 · df)
+        # The cross-range axis is angular-sampling-limited and the range axis is
+        # frequency-sampling-limited; picking the max gives a square viewport
+        # that never crops either axis, matching the convention other ISAR
+        # tools use.
+        half_x_m, half_y_m = _decoupled_scene_half_extents(theta, freq_uniform, df_eff)
+        half_m = max(half_x_m, half_y_m)
+        n_pix_default = int(np.clip(max(theta.size, freq_uniform.size), 128, 512))
+        complex_image, x_range, y_range = _compute_band_backprojection(
+            self,
+            rcs_slice,
+            theta,
+            freq_uniform,
+            n_pix_default,
+            n_pix_default,
+            half_m,
+            half_m,
+            unit_scale,
+        )
 
     # Sanity-check the computed scene extent.
     if (
@@ -437,6 +505,9 @@ def render(self) -> None:
     units_combo = getattr(self, "combo_isar_units", None)
     unit_name, unit_scale = _length_unit(units_combo.currentText() if units_combo else "m")
 
+    algo_combo = getattr(self, "combo_isar_algorithm", None)
+    algorithm = (algo_combo.currentText() if algo_combo else "Back-Projection").strip().lower()
+
     band_results = []
     for band_az_indices in bands:
         result = _compute_band(
@@ -448,6 +519,7 @@ def render(self) -> None:
             freq_hz,
             df,
             unit_scale,
+            algorithm=algorithm,
             az_target_deg=az_target_deg,
         )
         if isinstance(result, str):
@@ -455,13 +527,17 @@ def render(self) -> None:
             return
         band_results.append(result)
 
-    # Convert linear magnitudes to display values (absolute dBsm — a unit-
-    # amplitude scatterer reads 0 dB).
+    # Convert linear magnitudes to display values. ISAR image intensity is
+    # 10·log₁₀(|I|²) = 20·log₁₀(|I|) — feed *power* (|I|²) to the dB converter,
+    # not magnitude. `rcs_to_dbsm` interprets real inputs as already-linear
+    # power, so passing the bare magnitude would give 10·log₁₀(|I|) (half the
+    # correct dB value). Labelled "dB" rather than "dBsm" because the linear
+    # value isn't necessarily in m².
     for br in band_results:
         if self._plot_scale_is_linear():
             br["isar_display"] = br["magnitude"]
         else:
-            br["isar_display"] = self.active_dataset.rcs_to_dbsm(br["magnitude"])
+            br["isar_display"] = self.active_dataset.rcs_to_dbsm(br["magnitude"] ** 2)
 
     n_bands = len(band_results)
 
@@ -529,7 +605,8 @@ def render(self) -> None:
 
     elev_value = self.active_dataset.elevations[elev_idx]
     pol_value = self.active_dataset.polarizations[pol_idx]
-    fig_title = f"ISAR Image | Elevation {elev_value} deg | Pol {pol_value}"
+    algo_label = "PFA" if algorithm == "polar format" else "Back-Projection"
+    fig_title = f"ISAR Image | Elevation {elev_value} deg | Pol {pol_value} | {algo_label}"
     if n_bands > 1:
         self.plot_figure.suptitle(fig_title, color=self._current_plot_text())
     else:
@@ -544,9 +621,9 @@ def render(self) -> None:
         self.plot_colorbars = [colorbar]
         self._apply_colorbar_ticks(colorbar)
         if self._plot_scale_is_linear():
-            colorbar.set_label("RCS (Linear)", color=self._current_plot_text())
+            colorbar.set_label("Image Intensity (linear)", color=self._current_plot_text())
         else:
-            colorbar.set_label("RCS (dBsm)", color=self._current_plot_text())
+            colorbar.set_label("Image Intensity (dB)", color=self._current_plot_text())
         colorbar.ax.tick_params(colors=self._current_plot_text())
         for label in colorbar.ax.get_yticklabels():
             label.set_color(self._current_plot_text())
@@ -600,7 +677,7 @@ def render(self) -> None:
     # spacings ((max-min)/median); anything > ~0.001 was actually resampled.
     az_max = max(br.get("az_nonuniformity", 0.0) for br in band_results)
     fr_max = max(br.get("freq_nonuniformity", 0.0) for br in band_results)
-    parts = ["ISAR image updated (back-projection"]
+    parts = [f"ISAR image updated ({algo_label}"]
     if n_bands > 1:
         parts.append(f", {n_bands} bands")
     parts.append(")")

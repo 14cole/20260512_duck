@@ -42,6 +42,7 @@ class PlotContext:
     chk_colormap_invert: QCheckBox
     combo_isar_window: QComboBox
     combo_isar_units: QComboBox
+    combo_isar_algorithm: QComboBox
     chk_isar_az_interp: QCheckBox
     spin_isar_az_min: QDoubleSpinBox
     spin_isar_az_max: QDoubleSpinBox

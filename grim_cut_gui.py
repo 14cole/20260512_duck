@@ -698,6 +698,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             context.chk_colormap_invert.toggled.connect(self._on_colormap_changed)
             context.combo_isar_window.currentIndexChanged.connect(self._on_isar_window_changed)
             context.combo_isar_units.currentIndexChanged.connect(self._on_isar_window_changed)
+            context.combo_isar_algorithm.currentIndexChanged.connect(self._on_isar_window_changed)
             context.chk_isar_az_interp.toggled.connect(self._on_isar_window_changed)
             context.spin_isar_az_min.valueChanged.connect(self._on_isar_window_changed)
             context.spin_isar_az_max.valueChanged.connect(self._on_isar_window_changed)
@@ -871,6 +872,18 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         settings_layout.addWidget(combo_isar_units, row, 3)
         row += 1
 
+        settings_layout.addWidget(QLabel("ISAR Algorithm"), row, 0)
+        combo_isar_algorithm = QComboBox()
+        combo_isar_algorithm.addItems(["Back-Projection", "Polar Format"])
+        combo_isar_algorithm.setToolTip(
+            "Back-Projection: geometrically exact at any aperture (incl. 360°), slower.\n"
+            "Polar Format: 2-D IFFT of the (θ, f) data treated as Cartesian k-space — "
+            "fast, tolerates any aperture numerically, matches the absolute-dB convention "
+            "of most FFT-based ISAR tools, but distorts geometry away from broadside."
+        )
+        settings_layout.addWidget(combo_isar_algorithm, row, 1, 1, 5)
+        row += 1
+
         chk_isar_az_interp = QCheckBox("Interp Az")
         chk_isar_az_interp.setToolTip(
             "Resample azimuth onto a uniform grid before imaging. Periodic "
@@ -1013,6 +1026,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             chk_colormap_invert=chk_colormap_invert,
             combo_isar_window=combo_isar_window,
             combo_isar_units=combo_isar_units,
+            combo_isar_algorithm=combo_isar_algorithm,
             chk_isar_az_interp=chk_isar_az_interp,
             spin_isar_az_min=spin_isar_az_min,
             spin_isar_az_max=spin_isar_az_max,
